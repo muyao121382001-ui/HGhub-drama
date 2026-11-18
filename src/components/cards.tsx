@@ -31,10 +31,22 @@ export function WaterfallCard({ v, onOpen }: { v: VideoCard; onOpen: () => void 
 }
 
 /* ——— 近无缝瀑布流 ——— */
-export function Masonry({ videos, onOpen, wide = false, gap = "gap-1" }: {
-  videos: VideoCard[]; onOpen: (v: VideoCard) => void; wide?: boolean; gap?: string;
+export function Masonry({ videos, onOpen, wide = false, gap = "gap-1", rowMajor = false }: {
+  videos: VideoCard[]; onOpen: (v: VideoCard) => void; wide?: boolean; gap?: string; rowMajor?: boolean;
 }) {
   const mb = gap === "gap-1" ? "mb-1" : "mb-1.5";
+  if (rowMajor) {
+    /* 行优先：每行 2 个，第 1 行=1,2，第 2 行=3,4 …（仅安卓频道页启用） */
+    return (
+      <div className={`grid grid-cols-2 ${gap}`}>
+        {videos.map((v) => (
+          <div key={v.id}>
+            <WaterfallCard v={v} onOpen={() => onOpen(v)} />
+          </div>
+        ))}
+      </div>
+    );
+  }
   return (
     <div className={`${wide ? "columns-3 xl:columns-4" : "columns-2"} ${gap} [column-fill:balance]`}>
       {videos.map((v) => (
