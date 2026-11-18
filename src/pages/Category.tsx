@@ -169,7 +169,7 @@ export function ChannelPage({ cate, name, onBack, wide }: { cate: string; name: 
     setLoading(true);
     try {
       const next = page + 1;
-      const res = await api.category(cate, next, 20);
+      const res = await api.category(cate, next, 100);
       setItems((prev) => {
         const seen = new Set(prev.map((x) => x.id));
         return [...prev, ...(res?.items || []).filter((x) => !seen.has(x.id))];
