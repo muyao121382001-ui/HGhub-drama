@@ -207,7 +207,22 @@ pub async fn resolve_target(url: &Url, strict: bool) -> Result<Vec<SocketAddr>, 
     };
     sort_ipv6_first(&mut addrs);
     addrs.dedup();
-    check_addresses_with_mode(&addrs, strict)?;
+    if strict {
+        // 混合答案（常见于代理 DNS64 / TUN）：只在通过策略的地址上建立连接，
+        // 丢弃其余解析结果，避免连接器回退到私网、回环或保留地址；
+        // 全部不合规时才报错。
+        let kept: Vec<SocketAddr> = addrs
+            .iter()
+            .copied()
+            .filter(|addr| allowed_ip(addr.ip()))
+            .collect();
+        if kept.is_empty() {
+            return Err(
+                "禁止访问普通内网、回环或保留地址（仅放行 FakeIP 198.18.0.0/15）".into(),
+            );
+        }
+        addrs = kept;
+    }
     Ok(addrs)
 }
 
