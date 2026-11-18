@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, fmt } from "../api";
+import { api, fmt, platform } from "../api";
 import type { Post, VideoCard } from "../types";
 import { useStore } from "../store";
 import { Masonry, RowCard } from "../components/cards";
@@ -222,7 +222,7 @@ export function ChannelPage({ cate, name, onBack, wide }: { cate: string; name: 
       </div>
       <div className="flex-1 scroll-y px-4 pt-3 pb-8">
         {sorted.length ? (
-          <Masonry videos={sorted} wide={wide} onOpen={(v) => push({ kind: "feed", videoIds: sorted.map((x) => x.id), index: sorted.findIndex((x) => x.id === v.id), title: name })} />
+          <Masonry videos={sorted} wide={wide} rowMajor={platform === "android"} onOpen={(v) => push({ kind: "feed", videoIds: sorted.map((x) => x.id), index: sorted.findIndex((x) => x.id === v.id), title: name })} />
         ) : err ? (
           <Empty icon={<IGrid size={26} />} title="加载失败" sub={err} action="重试" onAction={loadMore} />
         ) : (
