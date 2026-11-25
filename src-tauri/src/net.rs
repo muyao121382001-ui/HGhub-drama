@@ -1,7 +1,6 @@
 //! 网络层：与上游站点对话。
 //!
-//! 站点把全部 `/api/**` 调用收敛成 `POST /api/edge/request` 的信封，
-//! 我们只实现这一个入口，其余接口都是「填 path」。
+//! 业务接口按原本的方法和路径直连 `{origin}{path}`；响应统一是 `{status, data, msg}` 结构。
 //!
 //! # 代理（用户反馈「浏览器能开、HGhub 打不开」的根因就在这里）
 //!
@@ -20,8 +19,6 @@
 //! `net_diag` 命令会输出 DNS/HTTP/环境变量快照。
 
 use crate::network_policy;
-use base64::engine::general_purpose::STANDARD as B64;
-use base64::Engine;
 use once_cell::sync::Lazy;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -464,7 +461,10 @@ fn edge_redirect_target(
     network_policy::redirect_target(current, location)
 }
 
-/// 业务请求：走边缘信封。
+/// 业务请求：直连上游业务接口（边缘信封停用后的兜底模式）。
+///
+/// 旧版本把所有 `/api/**` 调用包成 `POST /api/edge/request` 信封；上游停用该网关后，
+/// 这里改为按原本的方法和路径直接请求 `{origin}{path}`，响应仍是 `{status, data, msg}` 结构。
 pub async fn edge(
     origin: &str,
     method: &str,
@@ -483,48 +483,38 @@ pub async fn edge(
     {
         return Err("镜像线路仅供游客浏览；登录/注册请切换到固定线路".into());
     }
-    let (encoded, ctype) = match &body {
-        Some(v) => (
-            B64.encode(serde_json::to_vec(v).map_err(|e| e.to_string())?),
-            "application/json",
-        ),
-        None => (String::new(), ""),
-    };
-    let envelope = json!({
-        "method": method,
-        "path": path,
-        "body": encoded,
-        "content_type": ctype,
-    });
 
-    let url = format!("{cur}/api/edge/request");
-    let referer = format!("{cur}/");
     let token = token.map(|s| s.to_string());
+    let url = format!("{cur}{path}");
+    let referer = format!("{cur}/");
 
-    static NEXT_EDGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let request = NEXT_EDGE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    static NEXT_DIRECT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let request = NEXT_DIRECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let line_host = url::Url::parse(&cur)
         .unwrap()
         .host_str()
         .unwrap()
         .to_string();
     let operation = edge_operation(path);
-    let mut attempt = 0;
     let guest_get = method.eq_ignore_ascii_case("GET") && body.is_none() && token.is_none();
-    // 取播放地址的 POST 没有副作用，和 GET 一样允许重试
+    // 取播放地址的 POST 没有副作用，和 GET 一样允许重试。
     let can_retry = (method.eq_ignore_ascii_case("GET") && body.is_none())
         || (method.eq_ignore_ascii_case("POST") && operation == "play");
+
     let value = with_retry(can_retry, || {
-        attempt += 1;
-        let attempt = attempt;
-        let envelope = envelope.clone();
         let token = token.clone();
         let url = url.clone();
         let referer = referer.clone();
+        let body = body.clone();
+        let method = method.to_string();
         let line_host = line_host.clone();
+        let operation = operation;
         async move {
             let started = Instant::now();
-            crate::playback_log::record("api.begin", json!({"request": request, "attempt": attempt, "operation": operation, "method": method, "line_host": line_host}));
+            crate::playback_log::record(
+                "api.begin",
+                json!({"request": request, "operation": operation, "method": method, "line_host": line_host}),
+            );
             let mut status_code = None;
             let mut headers_ms = None;
             let mut target_host = line_host.clone();
@@ -535,24 +525,40 @@ pub async fn edge(
                 for hop in 0..=5 {
                     let (target, client) = client_for(next.as_str()).await?;
                     target_host = target.host_str().unwrap_or("").to_string();
-                    let mut req = client
-                        .post(target.clone())
+                    let mut req = match method.to_ascii_uppercase().as_str() {
+                        "POST" => client.post(target.clone()),
+                        _ => client.get(target.clone()),
+                    };
+                    req = req
                         .header("Accept", "application/json")
-                        .header("Referer", &referer)
-                        .json(&envelope);
+                        .header("Referer", &referer);
                     if let Some(t) = token.as_deref() {
                         if !t.is_empty() {
                             req = req.header("Authorization", format!("Bearer {t}"));
+                        }
+                    }
+                    if method.eq_ignore_ascii_case("POST") {
+                        if let Some(b) = body.as_ref() {
+                            req = req.json(b);
                         }
                     }
                     let resp = req.send().await.map_err(|e| err_text(&e))?;
                     let status = resp.status();
                     status_code = Some(status.as_u16());
                     headers_ms = Some(started.elapsed().as_millis() as u64);
-                    let ctype = resp.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+                    let ctype = resp
+                        .headers()
+                        .get(reqwest::header::CONTENT_TYPE)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("");
                     response_kind = if ctype.contains("json") { "json" } else if ctype.contains("html") { "html" } else { "other" };
-                    gateway = if resp.headers().contains_key("x-amz-cf-id") { "cloudfront" } else if resp.headers().contains_key("cf-ray") { "cloudflare" } else { "other" };
-                    // 逐跳重建并检查客户端；不自动把信封 POST 改成无信封 GET。
+                    gateway = if resp.headers().contains_key("x-amz-cf-id") {
+                        "cloudfront"
+                    } else if resp.headers().contains_key("cf-ray") {
+                        "cloudflare"
+                    } else {
+                        "other"
+                    };
                     if status.is_redirection() {
                         if hop == 5 {
                             return Err("重定向次数超过限制".into());
@@ -582,16 +588,26 @@ pub async fn edge(
                         .map_err(|e| format!("{e}: {}", text.chars().take(160).collect::<String>()));
                 }
                 Err("重定向次数超过限制".into())
-            }.await;
-            crate::playback_log::record("api.end", json!({
-                "request": request, "attempt": attempt, "operation": operation, "method": method,
-                "line_host": line_host, "target_host": target_host, "status": status_code,
-                "headers_ms": headers_ms, "elapsed_ms": started.elapsed().as_millis() as u64,
-                "response_kind": response_kind, "gateway": gateway,
-                "business_status": result.as_ref().ok().and_then(|v: &Value| v.get("status")).and_then(Value::as_i64),
-                "error_kind": result.as_ref().err().map(|e: &String| crate::playback_log::error_kind(e)),
-                "retryable": can_retry && result.as_ref().err().is_some_and(|e| retryable_error(e)),
-            }));
+            }
+            .await;
+            crate::playback_log::record(
+                "api.end",
+                json!({
+                    "request": request,
+                    "attempt": 1,
+                    "operation": operation,
+                    "method": method,
+                    "line_host": line_host,
+                    "target_host": target_host,
+                    "status": status_code,
+                    "headers_ms": headers_ms,
+                    "response_kind": response_kind,
+                    "gateway": gateway,
+                    "business_status": result.as_ref().ok().and_then(|v: &Value| v.get("status")).and_then(Value::as_i64),
+                    "error_kind": result.as_ref().err().map(|e: &String| crate::playback_log::error_kind(e)),
+                    "retryable": can_retry && result.as_ref().err().is_some_and(|e| retryable_error(e)),
+                }),
+            );
             result
         }
     })
